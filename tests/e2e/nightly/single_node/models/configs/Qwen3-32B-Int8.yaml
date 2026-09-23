@@ -3,9 +3,9 @@
 # ==========================================
 
 _envs: &envs
-  TASK_QUEUE_ENABLE: "1"
-  PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
   HCCL_OP_EXPANSION_MODE: "AIV"
+  PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+  TASK_QUEUE_ENABLE: "1"
   SERVER_PORT: "DEFAULT_PORT"
 
 _server_cmd: &server_cmd
@@ -27,8 +27,10 @@ _server_cmd: &server_cmd
   - "--trust-remote-code"
   - "--gpu-memory-utilization"
   - "0.9"
+  - "--additional-config"
+  - '{"ascend_compilation_config":{"enable_static_kernel":true}}'
 
-_benchmarks: &benchmarks
+_benchmarks: &benchmarks_1
   acc:
     case_type: accuracy
     dataset_path: vllm-ascend/gsm8k-lite
@@ -36,8 +38,8 @@ _benchmarks: &benchmarks
     dataset_conf: gsm8k/gsm8k_gen_0_shot_noncot_chat_prompt
     max_out_len: 10240
     batch_size: 32
-    baseline: 96
-    threshold: 10
+    # baseline: 96
+    threshold: 2
   perf:
     case_type: performance
     dataset_path: vllm-ascend/GSM8K-in3500-bs400
@@ -46,7 +48,28 @@ _benchmarks: &benchmarks
     num_prompts: 304
     max_out_len: 1500
     batch_size: 76
-    baseline: 1147.8159
+    # baseline: 1147.8159
+    threshold: 0.97
+
+_benchmarks: &benchmarks_2
+  acc:
+    case_type: accuracy
+    dataset_path: vllm-ascend/gsm8k-lite
+    request_conf: vllm_api_general_chat
+    dataset_conf: gsm8k/gsm8k_gen_0_shot_noncot_chat_prompt
+    max_out_len: 10240
+    batch_size: 32
+    # baseline: 96
+    threshold: 2
+  perf:
+    case_type: performance
+    dataset_path: vllm-ascend/GSM8K-in3500-bs400
+    request_conf: vllm_api_stream_chat
+    dataset_conf: gsm8k/gsm8k_gen_0_shot_cot_str_perf
+    num_prompts: 304
+    max_out_len: 1500
+    batch_size: 76
+    # baseline: 1147.8159
     threshold: 0.97
 
 # ==========================================
@@ -55,21 +78,22 @@ _benchmarks: &benchmarks
 
 test_cases:
   - name: "Qwen3-32B-W8A8-aclgraph-a3"
-    model: "vllm-ascend/Qwen3-32B-W8A8"
+    model: "vllm-ascend/Qwen3-32B-W8A8-QuaRot"
     envs:
       <<: *envs
     server_cmd: *server_cmd
     server_cmd_extra:
       - "--compilation-config"
-      - '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,12,16,20,24,32,48,60,64,68,72,76,80]}'
+      - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,12,16,20,24,32,48,60,64,68,72,76,80]}'
     benchmarks:
-      <<: *benchmarks
+      <<: *benchmarks_1
 
   - name: "Qwen3-32B-W8A8-single-a3"
-    model: "vllm-ascend/Qwen3-32B-W8A8"
+    model: "vllm-ascend/Qwen3-32B-W8A8-QuaRot"
     envs:
       <<: *envs
     server_cmd: *server_cmd
     server_cmd_extra:
       - "--enforce-eager"
     benchmarks:
+      <<: *benchmarks_2
