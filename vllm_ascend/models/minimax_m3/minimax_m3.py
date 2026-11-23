@@ -116,6 +116,10 @@ from vllm_ascend.models.minimax_m3.msa_m3 import (
     _register_m3_sparse_packed_modules,
     _use_fused_qkv_indexer,
 )
+from vllm_ascend.models.minimax_m3.ops.msa_m3_npu import (
+    _msa_index_a8c8_enabled,
+    _quantize_per_token_int8,
+)
 from vllm_ascend.ops.mmrs import SequenceParallelMMReduceScatterOp
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, vllm_version_is
 from vllm_ascend.worker.v2.pp_transport import (
@@ -207,6 +211,43 @@ def _scatter_index_cache(
         flat_cache,
         slots.view(-1, 1),
         updates,
+    )
+
+
+def _scatter_index_cache_a8c8(
+    cache: torch.Tensor,
+    key_scale: torch.Tensor,
+    updates: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Write INT8-quantized index keys plus their per-token scales.
+
+    Quantization happens on the post-rope BF16 values (fused
+    ``npu_dynamic_quant`` fast path on NPU, see ``_quantize_per_token_int8``).
+    The int8 key rows land at the same flat slot as the BF16 path; the
+    matching FP32 scale lands at the same slot of the ``key_scale`` ledger.
+    Both writes go through ``npu_scatter_nd_update_sk`` — the same custom op
+    the BF16 index-cache path already exercises under cudagraph capture, so
+    the A8C8 write path keeps the same graph coverage (FP32 buffers and
+    int32/int64 slot indices verified on device).
+    """
+    slots = slot_mapping.reshape(-1)
+    if slots.numel() == 0:
+        return
+
+    updates = updates.reshape(slots.shape[0], cache.shape[-1])
+    q, s = _quantize_per_token_int8(updates)
+
+    flat_cache = cache.view(-1, cache.shape[-1])
+    torch.ops._C_ascend.npu_scatter_nd_update_sk(
+        flat_cache,
+        slots.view(-1, 1),
+        q.contiguous(),
+    )
+    torch.ops._C_ascend.npu_scatter_nd_update_sk(
+        key_scale.view(-1, 1),
+        slots.view(-1, 1),
+        s.view(-1, 1).contiguous(),
     )
 
 
@@ -403,11 +444,19 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         idx_cache = self.indexer.index_cache.kv_cache
         if isinstance(idx_cache, (tuple, list)):
             idx_cache = idx_cache[0]
-        _scatter_index_cache(
-            idx_cache,
-            index_key[:num_tokens],
-            index_meta.slot_mapping[:num_tokens],
-        )
+        if getattr(self.indexer.index_cache, "a8c8", False):
+            _scatter_index_cache_a8c8(
+                idx_cache,
+                self.indexer.index_cache.ensure_key_scale(),
+                index_key[:num_tokens],
+                index_meta.slot_mapping[:num_tokens],
+            )
+        else:
+            _scatter_index_cache(
+                idx_cache,
+                index_key[:num_tokens],
+                index_meta.slot_mapping[:num_tokens],
+            )
 
     def _sparse_prepare(
         self,
@@ -492,6 +541,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         return (
             HAS_TRITON
             and hidden_states.shape[0] <= _MAX_FUSED_QKNORM_ROPE_CACHE_INSERT_TOKENS
+            # The fused Triton kernel writes the index cache in BF16/FP8 only;
+            # the A8C8 layout (int8 + per-token scale) must take the separate
+            # prepare/insert path.
+            and not _msa_index_a8c8_enabled()
             and hidden_states.device.type == "npu"
             and hidden_states.dtype == torch.bfloat16
             and positions.ndim == 1

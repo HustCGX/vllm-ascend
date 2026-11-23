@@ -51,6 +51,7 @@ from vllm_ascend.device.hardware_profile import (
 from vllm_ascend.models.minimax_m3.ops.msa_m3_npu import (
     _MSA_INDEX_BLOCK_SIZE,
     _decode_gbsa_metadata_key,
+    _msa_index_a8c8_enabled,
     minimax_m3_sparse_attn,
     minimax_m3_sparse_attn_decode,
     prepare_decode_gbsa_metadata,
@@ -315,6 +316,12 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.kv_cache_dtype = kv_cache_dtype
         self.prefix = prefix
         self.cache_config = cache_config
+        # A8C8: store the index K cache physically as INT8 with a separate
+        # per-token FP32 key_scale buffer; the main KV cache is unaffected.
+        self.a8c8 = _msa_index_a8c8_enabled()
+        if self.a8c8:
+            self.dtype = torch.int8
+        self.key_scale = torch.tensor([])
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -328,6 +335,36 @@ class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             cache_dtype_str=self.kv_cache_dtype,
         )
+
+    def ensure_key_scale(self) -> torch.Tensor:
+        """Lazily allocate the ``[NP, 1, P]`` FP32 key_scale after cache binding.
+
+        Untouched slots stay at 1.0 so dequantization of never-written pages
+        stays finite (matches the golden zero-vector scale convention).
+        """
+        cache = self.kv_cache
+        # vLLM binds layer caches as [tensor]; accept both forms.
+        if isinstance(cache, (tuple, list)):
+            cache = cache[0]
+        if not isinstance(cache, torch.Tensor) or cache.numel() == 0:
+            raise ValueError("key_scale requested before the index cache was bound")
+        num_pages, page = int(cache.shape[0]), int(cache.shape[1])
+        if self.key_scale.numel() != num_pages * page:
+            # The eager warmup dummy run reaches this allocation before
+            # torchair graph capture, so tracing only ever sees the
+            # already-allocated fast path. Refuse to bake a fresh torch.ones
+            # into a captured graph (its address would not persist across
+            # replays).
+            if torch.compiler.is_compiling():
+                raise RuntimeError(
+                    "key_scale must be allocated during the eager warmup dummy run, before graph capture"
+                )
+            self.key_scale = torch.ones(
+                (num_pages, 1, page),
+                dtype=torch.float32,
+                device=cache.device,
+            )
+        return self.key_scale
 
     def forward(self) -> None: ...
 
@@ -564,6 +601,13 @@ class AscendMiniMaxM3IndexerImpl(nn.Module):
         num_decode_tokens = index_md.num_decode_tokens
         iq = index_query[:num_tokens].view(-1, self.num_index_heads, self.index_head_dim)
         kv = self.index_cache.kv_cache
+        if getattr(self.index_cache, "a8c8", False):
+            # Two-element (cache, key_scale) tuples select the A8C8 scoring
+            # path in the shared score entry; mirrors the MXFP4 convention.
+            # vLLM binds layer caches as [tensor]; unwrap before pairing.
+            if isinstance(kv, (tuple, list)):
+                kv = kv[0]
+            kv = (kv, self.index_cache.ensure_key_scale())
 
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None

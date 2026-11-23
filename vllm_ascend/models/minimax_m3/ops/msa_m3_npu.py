@@ -3,16 +3,18 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from importlib import import_module
 from inspect import signature
 from typing import Any
 
 import torch
+import torch_npu
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.triton.msa.msa_m3_index_postprocess import index_decode_topk_fused
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 # Existing mode for A5 FP8 KV-gather-Q prefill.
 _SPARSE_ATTN_INNER_PRECISE = 4
@@ -106,6 +108,73 @@ def _as_ascendc_index_kv_cache(
     if isinstance(index_kv_cache, tuple):
         index_kv_cache = index_kv_cache[0]
     return index_kv_cache.unsqueeze(2)
+
+
+@lru_cache(maxsize=1)
+def _msa_index_a8c8_enabled() -> bool:
+    """Opt-in switch for the native A8C8 index-scoring path.
+
+    Requires all of: ``VLLM_ASCEND_MSA_INDEX_A8C8=1``, an A2/A3 device, and a
+    ``cann_ops_transformer`` build whose ``msa_index_score_v2`` exposes the
+    ``query_scale``/``key_scale`` A8C8 parameters. Any miss keeps the BF16
+    path untouched.
+    """
+    if os.environ.get("VLLM_ASCEND_MSA_INDEX_A8C8", "0") != "1":
+        return False
+    if get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3):
+        return False
+    try:
+        from cann_ops_transformer.ops import msa_index_score_v2
+
+        params = signature(msa_index_score_v2).parameters
+        return "query_scale" in params and "key_scale" in params
+    except Exception:  # noqa: BLE001 -- vendor package without V2 A8C8 support
+        return False
+
+
+def _quantize_per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-token dynamic INT8 quantization along the last dim.
+
+    On NPU this takes torch_npu's fused single-kernel ``npu_dynamic_quant``
+    (the same op the DSA indexer and W8A8 paths use; 7 small aten kernels
+    -> 2). The fused op's scale is bit-exact ``max|x| / 127`` and its
+    zero-amplitude rows come back with ``scale == 0``, which is clamped back
+    to 1 to keep scales positive and finite (the scoring kernel's contract;
+    the quantized row is all zeros either way, so the dequantized value is
+    unchanged). The fused op truncates ties on ~0.1% of values where the
+    reference chain rounds half-to-even; both stay self-consistent with the
+    scale they return, which is all the kernel requires.
+
+    The reference chain is CPU-portable and matches the operator ST golden
+    contract bit-for-bit (symmetric ``max|x| / 127``, zero-vector scale 1,
+    zero-point 0, round-to-nearest-even, clip ``[-127, 127]``).
+    Returns ``(int8 [.., D], fp32 scale [..])``.
+    """
+    if x.device.type == "npu":
+        q, s = torch_npu.npu_dynamic_quant(x.contiguous())
+        s = torch.where(s > 0, s, torch.ones_like(s))
+        return q, s
+    x_f32 = x.to(torch.float32)
+    amax = x_f32.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax > 0, amax * (1.0 / 127.0), torch.ones_like(amax))
+    q = torch.round(x_f32 / scale).clamp_(min=-127, max=127).to(torch.int8)
+    return q, scale.squeeze(-1).to(torch.float32)
+
+
+def _split_index_cache(
+    index_kv_cache: torch.Tensor | tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Split the runtime index cache into ``(BBND tensor, key_scale or None)``.
+
+    A two-element ``(cache, key_scale)`` tuple marks the A8C8 layout, following
+    the same convention as the MXFP4 index-scoring integration.
+    """
+    key_scale = None
+    if isinstance(index_kv_cache, (tuple, list)):
+        if len(index_kv_cache) > 1:
+            key_scale = index_kv_cache[1]
+        index_kv_cache = index_kv_cache[0]
+    return index_kv_cache.unsqueeze(2), key_scale
 
 
 def _split_main_kv_cache(
@@ -434,10 +503,35 @@ def _minimax_m3_index_score(
     A causal mask selects sparse mode 3; passing no mask selects dense mode 0.
     ``init_blocks`` and ``local_blocks`` are kept for parity with the index
     scoring interface; candidate forcing is applied by the TopK stage.
+
+    An INT8 index cache (with its per-token ``key_scale``) selects the native
+    A8C8 path: the BF16 query is quantized per token/head on the fly and the
+    operator call is switched to ``msa_index_score_v2``.
     """
+    index_kv_cache, key_scale = _split_index_cache(index_kv_cache)
+    if index_kv_cache.dtype == torch.int8:
+        assert key_scale is not None, "INT8 index cache must carry key_scale [NP, 1, P] fp32"
+        from cann_ops_transformer.ops import msa_index_score_v2
+
+        idx_q_int8, query_scale = _quantize_per_token_int8(idx_q)
+        return msa_index_score_v2(
+            idx_q_int8,
+            index_kv_cache,
+            start_loc,
+            block_table=block_table,
+            query_scale=query_scale,
+            key_scale=key_scale,
+            atten_mask=causal_mask,
+            actual_seq_qlen=cu_seqlens_q,
+            actual_seq_klen=seq_lens,
+            layout_key="BBND",
+            sparse_mode=3 if causal_mask is not None else 0,
+            init_blocks=0,
+            local_blocks=0,
+        )
+
     from cann_ops_transformer.ops import msa_index_score
 
-    index_kv_cache = _as_ascendc_index_kv_cache(index_kv_cache)
     if index_kv_cache.dtype == torch.float8_e4m3fn and idx_q.dtype != index_kv_cache.dtype:
         idx_q = _to_fp8_e4m3(idx_q)
     return msa_index_score(
@@ -524,6 +618,11 @@ def _can_use_index_score_topk_fusion(topk: int) -> bool:
     {2, 4, 8} produced values like ``1050427392`` and ``-8388609``; ``topk`` in
     {8, 16, 24, 32} was exact for every shape measured.
     """
+    # A8C8 stores the index cache as INT8 + per-token scale; only the plain
+    # score entry carries the msa_index_score_v2 call. Keep the fused-TopK
+    # variant out of the way while A8C8 is enabled.
+    if _msa_index_a8c8_enabled():
+        return False
     if not get_current_hardware_profile().supports(HardwareCapability.MINIMAX_M3_INDEX_SCORE_TOPK_FUSION):
         return False
     if not 0 < topk <= _INDEX_SCORE_TOPK_MAX or topk % _INDEX_SCORE_TOPK_WRITE_ALIGNMENT != 0:
