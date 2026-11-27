@@ -900,6 +900,89 @@ def _configure_minimax_m3_a5_mixed_kv_cache(vllm_config: VllmConfig) -> None:
     )
 
 
+def _minimax_m3_gqa_layer_ids(model_config) -> list[str]:
+    """Return the dense GQA layer ids of a MiniMax-M3 hybrid-attention model.
+
+    Reads the source-of-truth HF architectures because the platform hook runs
+    before ModelConfig.architecture is populated.
+    """
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or ()
+    if not _MINIMAX_M3_ARCHITECTURES.intersection(architectures):
+        return []
+
+    text_config = getattr(model_config, "hf_text_config", None)
+    if text_config is None:
+        return []
+    num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+    if not isinstance(num_hidden_layers, int):
+        return []
+
+    sparse_config = getattr(text_config, "sparse_attention_config", None) or {}
+    if sparse_config:
+        sparse_freq = sparse_config.get("sparse_attention_freq") or []
+        sparse_layer_ids = {layer_idx for layer_idx, freq in enumerate(sparse_freq) if freq != 0}
+    else:
+        layer_types = getattr(text_config, "layer_types", None) or ()
+        sparse_layer_ids = {i for i, layer_type in enumerate(layer_types) if layer_type == "minimax_m3_sparse"}
+    return [str(layer_idx) for layer_idx in range(num_hidden_layers) if layer_idx not in sparse_layer_ids]
+
+
+def _configure_minimax_m3_a3_int8_kv_cache(vllm_config) -> None:
+    """Keep MiniMax-M3 GQA KV cache in BF16 on the A2/A3 INT8 path.
+
+    ``--kv-cache-dtype int8`` switches the sparse layers' main KV cache to
+    INT8 for the CANN GBSA quantType=7 full-quantization mode. The dense GQA
+    layers and the lightning-indexer K cache stay BF16 because their kernels
+    have no INT8 path.
+    """
+    model_config = vllm_config.model_config
+    cache_config = vllm_config.cache_config
+    if (
+        model_config is None
+        or cache_config is None
+        or cache_config.cache_dtype != "int8"
+    ):
+        return
+
+    gqa_layer_ids = _minimax_m3_gqa_layer_ids(model_config)
+    if not gqa_layer_ids:
+        return
+
+    if not get_current_hardware_profile().supports(HardwareCapability.MINIMAX_M3_INT8_SPARSE_ATTENTION):
+        raise ValueError(
+            "MiniMax-M3 INT8 sparse attention (--kv-cache-dtype int8) requires the "
+            "CANN GBSA quantType=7 kernels available on Atlas A2/A3 series devices. "
+            "Use a BF16/Fp8 KV cache or run on a supported device."
+        )
+
+    text_config = getattr(model_config, "hf_text_config", None)
+    num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+    num_heads = getattr(text_config, "num_attention_heads", None)
+    head_dim = getattr(text_config, "head_dim", None)
+    if isinstance(num_heads, int) and isinstance(num_kv_heads, int) and num_heads % num_kv_heads == 0:
+        group_size = num_heads // num_kv_heads
+        if group_size > 16:
+            raise ValueError(
+                f"MiniMax-M3 INT8 sparse attention requires a GQA group size <= 16, got {group_size} "
+                f"({num_heads} query heads over {num_kv_heads} KV heads)."
+            )
+    if head_dim is not None and head_dim not in (128, 256):
+        raise ValueError(
+            f"MiniMax-M3 INT8 sparse attention requires head_dim 128 or 256, got {head_dim}."
+        )
+
+    skip_layers = list(dict.fromkeys(str(layer) for layer in (cache_config.kv_cache_dtype_skip_layers or [])))
+    known_skip_layers = set(skip_layers)
+    skip_layers.extend(layer for layer in gqa_layer_ids if layer not in known_skip_layers)
+    cache_config.kv_cache_dtype_skip_layers = skip_layers
+    logger.info_once(
+        "Using BF16 KV cache for MiniMax-M3 GQA layers %s; sparse layers run CANN GBSA INT8 "
+        "full quantization with the configured int8 KV cache.",
+        ", ".join(gqa_layer_ids),
+    )
+
+
 def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
     """
     Check and correct parameters in VllmConfig that are incompatible with Ascend NPU.
@@ -935,6 +1018,7 @@ def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
             vllm_config.cache_config.calculate_kv_scales = False
 
         _configure_minimax_m3_a5_mixed_kv_cache(vllm_config)
+        _configure_minimax_m3_a3_int8_kv_cache(vllm_config)
 
     # ==================== 3. MultiModal Config ====================
     multimodal_config = getattr(model_config, "multimodal_config", None) if model_config else None

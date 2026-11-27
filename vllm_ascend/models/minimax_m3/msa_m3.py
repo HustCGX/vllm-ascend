@@ -907,6 +907,10 @@ class AscendMiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[AscendMiniMa
                     kv_cache_spec.dtype == torch.float8_e4m3fn
                     and hardware_profile.supports(HardwareCapability.FP8_ATTENTION)
                 )
+                or (
+                    kv_cache_spec.dtype == torch.int8
+                    and hardware_profile.supports(HardwareCapability.MINIMAX_M3_INT8_SPARSE_ATTENTION)
+                )
             )
             and vllm_config.model_config.dtype == torch.bfloat16
         ):
@@ -1121,6 +1125,30 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
             HardwareCapability.FP8_ATTENTION
         ):
             raise TypeError("MiniMax-M3 FP8 sparse attention is not supported on this device")
+        self.use_int8_attention = kv_cache_dtype == "int8"
+        if self.use_int8_attention:
+            hardware_profile = get_current_hardware_profile()
+            if not hardware_profile.supports(HardwareCapability.MINIMAX_M3_INT8_SPARSE_ATTENTION):
+                raise TypeError(
+                    "MiniMax-M3 INT8 sparse attention requires the CANN GBSA quantType=7 "
+                    "kernels available on Atlas A2/A3 series devices"
+                )
+            group_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+            if head_size not in (128, 256):
+                raise TypeError(
+                    f"MiniMax-M3 INT8 sparse attention requires head_dim 128 or 256, got {head_size}"
+                )
+            if num_heads % group_kv_heads != 0 or num_heads // group_kv_heads > 16:
+                raise TypeError(
+                    "MiniMax-M3 INT8 sparse attention requires a GQA group size <= 16, got "
+                    f"{num_heads} query heads over {group_kv_heads} KV heads"
+                )
+            if topk_blocks < 12:
+                # Below this the GBSA flash-decoding schedule is disabled and
+                # the INT8 kernel rejects the call.
+                raise TypeError(
+                    f"MiniMax-M3 INT8 sparse attention requires topk_blocks >= 12, got {topk_blocks}"
+                )
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = scale
@@ -1177,6 +1205,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                     dtype=torch.float32,
                     device=query.device,
                 )
+            int8_scales = self._get_int8_scales(layer)
             minimax_m3_sparse_attn_decode(
                 q[:num_decode_tokens],
                 kv_cache,
@@ -1191,6 +1220,9 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                 select_num_idx=decode_select_num_idx,
                 dequant_scale=self._dequant_scale,
                 cu_seqlens_q=d.cu_seqlens_q,
+                int8_k_scale=int8_scales[0],
+                int8_v_scale=int8_scales[1],
+                int8_p_scale=int8_scales[2],
                 gbsa_metadata_cache=d.gbsa_metadata_cache,
                 indices_are_sorted=_USE_ASCENDC_INDEX_SCORE_DECODE or _TRITON_DECODE_SUPPORTS_SORTED_INDICES,
             )
@@ -1217,6 +1249,7 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                     p.union_gbsa_metadata[(self.num_heads, self.topk_blocks)],
                 )
             else:
+                int8_scales = self._get_int8_scales(layer)
                 minimax_m3_sparse_attn(
                     q[num_decode_tokens:],
                     kv_cache,
@@ -1232,8 +1265,24 @@ class AscendMiniMaxM3SparseImpl(AttentionImplBase[AscendMiniMaxM3SparseMetadata]
                     block_size=self.block_size,
                     total_kv_blocks=p.total_kv_blocks,
                     max_kv_blocks=p.max_kv_blocks,
+                    int8_k_scale=int8_scales[0],
+                    int8_v_scale=int8_scales[1],
+                    int8_p_scale=int8_scales[2],
                 )
         return output
+
+    def _get_int8_scales(
+        self, layer: AttentionLayer
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Fetch the layer-owned GBSA INT8 scales (None unless INT8 mode)."""
+        if not self.use_int8_attention:
+            return None, None, None
+        k_scale = getattr(layer, "_int8_k_scale_cache", None)
+        if k_scale is None:
+            raise RuntimeError(
+                "MiniMax-M3 INT8 sparse attention ran before any KV cache write allocated the K-scale cache"
+            )
+        return k_scale, layer.int8_v_scale, layer.int8_p_scale
 
     @staticmethod
     def update_graph_params(

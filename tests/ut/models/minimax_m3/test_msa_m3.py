@@ -3654,3 +3654,205 @@ def test_gbsa_reuse_rejects_nonuniform_shape_contract(mock_gbsa_ops):
             gbsa_metadata_cache=cache,
         )
     assert not cache and metadata_op.call_count == 2
+
+
+# ---------------- GBSA INT8 full quantization (quantType=7) ----------------
+
+
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A2, AscendDeviceType.A3])
+def test_gbsa_int8_quant_mode_and_fp32_softmax(device_type, monkeypatch):
+    monkeypatch.setattr(msa_m3_npu_module, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
+    assert msa_m3_npu_module._gbsa_quant_mode(torch.int8) == msa_m3_npu_module._GBSA_INT8_FULL_QUANT
+    assert msa_m3_npu_module._gbsa_softmax_precision(torch.int8) == 0
+
+
+def test_m3_kv_cache_dtype_int8_resolves_native_int8() -> None:
+    cache_config = SimpleNamespace(cache_dtype="int8", kv_cache_dtype_skip_layers=None)
+    model_config = SimpleNamespace(dtype=torch.bfloat16)
+
+    assert _resolve_layer_kv_cache_dtypes(cache_config, "model.layers.3.self_attn", model_config) == (
+        "int8",
+        torch.int8,
+    )
+
+
+@pytest.mark.parametrize("device_type", [AscendDeviceType.A2, AscendDeviceType.A3])
+def test_int8_sparse_impl_accepted_on_a2a3(monkeypatch, device_type):
+    monkeypatch.setattr(msa_m3_module, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
+    impl = AscendMiniMaxM3SparseImpl(16, 128, 0.5, 1, "int8", topk_blocks=16, sparse_block_size=128)
+    assert impl.use_int8_attention
+    # Union prefill only supports quantType=0 on A2/A3 and must stay off.
+    assert not impl.use_union_attention
+
+
+def test_int8_sparse_impl_rejected_without_capability(monkeypatch):
+    monkeypatch.setattr(
+        msa_m3_module, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A5)
+    )
+    with pytest.raises(TypeError, match="quantType=7"):
+        AscendMiniMaxM3SparseImpl(16, 128, 0.5, 1, "int8", topk_blocks=16, sparse_block_size=128)
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "num_kv_heads", "head_size", "topk_blocks", "match"),
+    [
+        (64, 2, 128, 16, "group size"),
+        (16, 1, 96, 16, "head_dim"),
+        (16, 1, 128, 8, "topk_blocks"),
+    ],
+)
+def test_int8_sparse_impl_rejects_unsupported_geometry(
+    monkeypatch, num_heads, num_kv_heads, head_size, topk_blocks, match
+):
+    monkeypatch.setattr(
+        msa_m3_module, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A3)
+    )
+    with pytest.raises(TypeError, match=match):
+        AscendMiniMaxM3SparseImpl(
+            num_heads, head_size, 0.5, num_kv_heads, "int8", topk_blocks=topk_blocks, sparse_block_size=128
+        )
+
+
+@pytest.fixture
+def mock_int8_dynamic_quant(monkeypatch: pytest.MonkeyPatch):
+    """Replace torch_npu per-token quantization with a CPU-safe stub."""
+    stub = MagicMock(
+        side_effect=lambda x, dst_type=None: (
+            torch.zeros(x.shape, dtype=torch.int8),
+            torch.ones(x.shape[0], 1, dtype=torch.float32),
+        )
+    )
+    monkeypatch.setattr(msa_m3_npu_module, "torch_npu", SimpleNamespace(npu_dynamic_quant=stub))
+    return stub
+
+
+def test_int8_prefill_bypasses_k2q_and_quantizes_q(monkeypatch, mock_gbsa_ops, mock_int8_dynamic_quant):
+    metadata_op, attention_op = mock_gbsa_ops
+    attention_op.side_effect = lambda q, *args, **kwargs: (
+        torch.zeros(q.shape, dtype=kwargs["attention_out_dtype"]),
+        None,
+    )
+    k2q = MagicMock()
+    monkeypatch.setattr(msa_m3_npu_module, "_minimax_m3_sparse_attn_kv_gather_q", k2q)
+    monkeypatch.setattr(msa_m3_npu_module, "_is_minimax_sparse_attention_split_kv_available", lambda: True)
+
+    q = torch.randn((4, 16, 128), dtype=torch.bfloat16)
+    kv = (
+        torch.zeros((4, 128, 1, 128), dtype=torch.int8),
+        torch.zeros((4, 128, 1, 128), dtype=torch.int8),
+    )
+    topk = torch.zeros((1, 4, 16), dtype=torch.int32)
+    block_table = torch.zeros((1, 4), dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 4], dtype=torch.int64)
+    seq_lens = torch.tensor([512], dtype=torch.int32)
+    output = torch.empty_like(q)
+    scales = (
+        torch.ones((4, 1, 128), dtype=torch.float32),
+        torch.ones((1, 128), dtype=torch.float32),
+        torch.full((1,), 127.0, dtype=torch.float32),
+    )
+    msa_m3_npu_module.minimax_m3_sparse_attn(
+        q,
+        kv,
+        topk,
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        None,
+        4,
+        1,
+        1.0,
+        output,
+        int8_k_scale=scales[0],
+        int8_v_scale=scales[1],
+        int8_p_scale=scales[2],
+    )
+    k2q.assert_not_called()
+    assert mock_int8_dynamic_quant.call_count == 1
+    attention_op.assert_called_once()
+    call = attention_op.call_args
+    assert call.args[0].dtype == torch.int8
+    assert call.args[1] is kv[0]
+    kwargs = call.kwargs
+    assert kwargs["quant_mode"] == 7
+    assert kwargs["softmax_precision"] == 0
+    assert kwargs["attention_out_dtype"] == torch.bfloat16
+    assert kwargs["q_dequant_scale"].shape == (4, 16)
+    assert kwargs["q_dequant_scale"].dtype == torch.float32
+    assert kwargs["k_dequant_scale"] is scales[0]
+    assert kwargs["v_dequant_scale"] is scales[1]
+    assert kwargs["p_quant_scale"] is scales[2]
+    assert metadata_op.call_count == 1
+    assert metadata_op.call_args.kwargs["quant_mode"] == 7
+
+
+def test_int8_missing_scales_rejected(mock_gbsa_ops, mock_int8_dynamic_quant):
+    _, attention_op = mock_gbsa_ops
+    q = torch.zeros((2, 16, 128), dtype=torch.bfloat16)
+    kv = (
+        torch.zeros((2, 128, 1, 128), dtype=torch.int8),
+        torch.zeros((2, 128, 1, 128), dtype=torch.int8),
+    )
+    with pytest.raises(TypeError, match="k/v/p dequant scales"):
+        msa_m3_npu_module._run_generic_block_sparse_attention(
+            q,
+            kv[0],
+            kv[1],
+            torch.zeros((1, 2, 16), dtype=torch.int32),
+            torch.zeros((1, 2), dtype=torch.int32),
+            torch.ones((1, 2), dtype=torch.int32),
+            torch.tensor([0, 2], dtype=torch.int64),
+            torch.tensor([257], dtype=torch.int32),
+            num_kv_heads=1,
+            sm_scale=1.0,
+            block_size=128,
+        )
+    attention_op.assert_not_called()
+
+
+def test_int8_decode_forward_passes_layer_scales(monkeypatch, mock_gbsa_ops, mock_int8_dynamic_quant):
+    metadata_op, attention_op = mock_gbsa_ops
+    attention_op.side_effect = lambda q, *args, **kwargs: (
+        torch.zeros(q.shape, dtype=kwargs["attention_out_dtype"]),
+        None,
+    )
+    monkeypatch.setattr(
+        msa_m3_module, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A3)
+    )
+    impl = AscendMiniMaxM3SparseImpl(16, 128, 0.5, 1, "int8", topk_blocks=16, sparse_block_size=128)
+    builder = _make_sparse_builder(torch.device("cpu"), torch.int8, impl=impl)
+    common = _create_common_attn_metadata(BatchSpec(seq_lens=[257], query_lens=[1]), 128, torch.device("cpu"))
+    md = builder.build(0, common)
+    assert builder.reuse_decode_gbsa_metadata
+    assert builder.decode_gbsa_metadata_buffers
+    monkeypatch.setattr(
+        msa_m3_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"attn": md}),
+    )
+    native_decode = MagicMock()
+    monkeypatch.setattr(msa_m3_module, "minimax_m3_sparse_attn_decode", native_decode)
+    k_scale = torch.ones((9, 1, 128), dtype=torch.float32)
+    v_scale = torch.ones((1, 128), dtype=torch.float32)
+    p_scale = torch.full((1,), 127.0, dtype=torch.float32)
+    layer = SimpleNamespace(
+        layer_name="attn",
+        _int8_k_scale_cache=k_scale,
+        int8_v_scale=v_scale,
+        int8_p_scale=p_scale,
+    )
+    q = torch.zeros((1, 16 * 128), dtype=torch.bfloat16)
+    selections = (
+        torch.zeros((1, 1, 16), dtype=torch.int32),
+        None,
+        torch.ones((1, 1), dtype=torch.int32),
+    )
+    output = torch.empty_like(q)
+    assert impl.forward(layer, q, (torch.empty(0), torch.empty(0)), selections, output) is output
+    native_decode.assert_called_once()
+    kwargs = native_decode.call_args.kwargs
+    assert kwargs["int8_k_scale"] is k_scale
+    assert kwargs["int8_v_scale"] is v_scale
+    assert kwargs["int8_p_scale"] is p_scale
+    assert metadata_op.call_count == 1
+    assert metadata_op.call_args.kwargs["quant_mode"] == 7

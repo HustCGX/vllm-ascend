@@ -20,6 +20,19 @@ The features described below are those enabled by the deployment commands in thi
 
 Refer to the [Supported Models](../../user_guide/support_matrix/supported_models.md) page for the support matrix and the [Feature Guide](../../user_guide/feature_guide/index.md) for feature configuration.
 
+### 2.1 Optional INT8 Sparse-Attention KV Cache (Atlas A2/A3) {: #21-optional-int8-sparse-attention-kv-cache }
+
+On Atlas A2/A3 devices, adding `--kv-cache-dtype int8` switches the MiniMax-M3 block-sparse attention layers to the CANN `GenericBlockSparseAttention` INT8 full-quantization mode: the sparse layers' K/V caches are stored as INT8 (halving sparse-layer KV memory) and both prefill and decode run the quantized kernel. Dense GQA layers and the lightning-indexer K cache always stay BF16, so no extra flags are needed for them. This mode requires a CANN package that ships the GBSA `quantType=7` kernels and a GQA group size of at most 16 (satisfied by M3.1-Flash's 64 query heads over 4 KV heads).
+
+The K scales are dynamic (per token and head, computed at cache-write time). The V per-channel scale and the P per-tensor scale are static; their defaults only make the path runnable and should be calibrated for production accuracy:
+
+```bash
+export VLLM_ASCEND_M3_INT8_V_SCALE=1.0   # V per-channel dequant scale
+export VLLM_ASCEND_M3_INT8_P_SCALE=127.0 # P per-tensor quant scale
+```
+
+When combining INT8 KV with DSpark speculative decoding, keep the draft model's KV cache in BF16 by passing `"kv_cache_dtype":"bfloat16"` inside `--speculative-config` (the documented recipes already do this).
+
 ## 3 Prerequisites
 
 ### 3.1 Model Weight

@@ -109,6 +109,11 @@ class HardwareCapability(Enum):
     # Prepare and reuse the fixed CANN GBSA schedule across supported M3 decode layers.
     # Callers must also check block size, dtype, and uniform query length.
     MINIMAX_M3_GBSA_METADATA_REUSE = auto()
+    # CANN GBSA INT8 full-quantization mode (quantType=7) for MiniMax-M3
+    # sparse attention: INT8 Q/K/V with FP32 q/k/v/p scales. A2/A3 only;
+    # callers must also check headDim (128/256), GQA group size (<=16), and
+    # that the installed CANN package ships the INT8 GBSA kernels.
+    MINIMAX_M3_INT8_SPARSE_ATTENTION = auto()
     # CANN MsaIndexScore ``return_choice`` TopK fusion, which replaces the
     # separate TopK and sort post-processing. Callers must also check that the
     # installed CANN package provides the fused output and that the index score
@@ -397,6 +402,7 @@ _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
     HardwareCapability.KDA_INT8_QUANT_OVERLAP,
     HardwareCapability.NATIVE_INT8_SPARSE,
     HardwareCapability.MINIMAX_M3_GBSA_METADATA_REUSE,
+    HardwareCapability.MINIMAX_M3_INT8_SPARSE_ATTENTION,
     HardwareCapability.RMS_NORM_DYNAMIC_QUANT,
     HardwareCapability.MC2_FULLMESH_V2_COMM,
     HardwareCapability.MM_REDUCE_SCATTER_BF16,
@@ -430,6 +436,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
                 HardwareCapability.QWEN4EXP_HC_GATE_MIX_ROW_BLOCK,
                 HardwareCapability.RMS_NORM_CAST,
                 HardwareCapability.NPU_TOP_K_TOP_P,
+                HardwareCapability.MINIMAX_M3_INT8_SPARSE_ATTENTION,
             },
         ),
         AscendDeviceType.A3: HardwareProfile(

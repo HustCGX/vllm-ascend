@@ -9,6 +9,7 @@ from inspect import signature
 from typing import Any
 
 import torch
+import torch_npu
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.triton.msa.msa_m3_index_postprocess import index_decode_topk_fused
@@ -27,6 +28,7 @@ _MSA_INDEX_BLOCK_SIZE = 128
 _GBSA_MASK_MODE_CAUSAL = 1
 _GBSA_NO_QUANT = 0
 _GBSA_FP8_STATIC_CAST_P = 5
+_GBSA_INT8_FULL_QUANT = 7
 _GBSA_SOFTMAX_PRECISION = 0
 _GBSA_FP8_SOFTMAX_PRECISION = 1
 _MSA_SCORE_BLOCK_ALIGNMENT = 16
@@ -155,9 +157,20 @@ def _build_cu_seqlens_q(query_lens: torch.Tensor) -> torch.Tensor:
 def _gbsa_softmax_precision(kv_cache_dtype: torch.dtype) -> int:
     if kv_cache_dtype == torch.float8_e4m3fn:
         return _GBSA_FP8_SOFTMAX_PRECISION
+    if kv_cache_dtype == torch.int8:
+        # GBSA quantType=7 requires softmaxPrecision=0 (FP32 S/Softmax).
+        return _GBSA_SOFTMAX_PRECISION
     if kv_cache_dtype == torch.bfloat16:
         return get_current_hardware_profile().minimax_m3_gbsa_bf16_softmax_precision
     return _GBSA_SOFTMAX_PRECISION
+
+
+def _gbsa_quant_mode(kv_cache_dtype: torch.dtype) -> int:
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        return _GBSA_FP8_STATIC_CAST_P
+    if kv_cache_dtype == torch.int8:
+        return _GBSA_INT8_FULL_QUANT
+    return _GBSA_NO_QUANT
 
 
 def _decode_gbsa_metadata_key(
@@ -259,7 +272,7 @@ def prepare_decode_gbsa_metadata(
         head_size=head_size,
         block_size=_MSA_INDEX_BLOCK_SIZE,
         max_query_len=query_len,
-        quant_mode=_GBSA_FP8_STATIC_CAST_P if kv_cache_dtype == torch.float8_e4m3fn else _GBSA_NO_QUANT,
+        quant_mode=_gbsa_quant_mode(kv_cache_dtype),
         softmax_precision=_gbsa_softmax_precision(kv_cache_dtype),
     )
 
@@ -296,6 +309,9 @@ def _run_generic_block_sparse_attention(
     block_size: int,
     max_query_len: int = -1,
     dequant_scale: torch.Tensor | None = None,
+    int8_k_scale: torch.Tensor | None = None,
+    int8_v_scale: torch.Tensor | None = None,
+    int8_p_scale: torch.Tensor | None = None,
     gbsa_metadata_cache: dict[tuple[Any, ...], torch.Tensor] | None = None,
     indices_are_sorted: bool = False,
 ) -> torch.Tensor:
@@ -311,16 +327,33 @@ def _run_generic_block_sparse_attention(
     cu_seqlens_q = cu_seqlens_q.to(dtype=torch.int64).contiguous()
     seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
 
-    quant_mode = _GBSA_NO_QUANT
+    quant_mode = _gbsa_quant_mode(key.dtype)
     softmax_precision = _gbsa_softmax_precision(key.dtype)
     quant_kwargs: dict[str, Any] = {}
     if key.dtype == torch.float8_e4m3fn:
         if value.dtype != torch.float8_e4m3fn:
             raise TypeError("MiniMax-M3 FP8 sparse attention requires both K and V caches in E4M3")
         q = _to_fp8_e4m3(q)
-        quant_mode = _GBSA_FP8_STATIC_CAST_P
         # GBSA quant mode 5 requires precision 1. BF16 follows the hardware policy.
         quant_kwargs = {"attention_out_dtype": torch.bfloat16}
+    elif key.dtype == torch.int8:
+        if value.dtype != torch.int8:
+            raise TypeError("MiniMax-M3 INT8 sparse attention requires both K and V caches in INT8")
+        if int8_k_scale is None or int8_v_scale is None or int8_p_scale is None:
+            raise TypeError("MiniMax-M3 INT8 sparse attention requires the k/v/p dequant scales")
+        # Per-token per-head dynamic Q quantization; the [T, qHeads] FP32
+        # scales match GBSA's TND q_dequant_scale layout.
+        num_tokens = q.shape[0]
+        q_rows = q.reshape(num_tokens * q.shape[1], q.shape[2])
+        q, q_row_scales = torch_npu.npu_dynamic_quant(q_rows, dst_type=torch.int8)
+        q = q.reshape(num_tokens, -1, q_rows.shape[1])
+        quant_kwargs = {
+            "q_dequant_scale": q_row_scales.reshape(num_tokens, -1).to(torch.float32).contiguous(),
+            "k_dequant_scale": int8_k_scale,
+            "v_dequant_scale": int8_v_scale,
+            "p_quant_scale": int8_p_scale,
+            "attention_out_dtype": torch.bfloat16,
+        }
     elif q.dtype != key.dtype or value.dtype != key.dtype:
         raise TypeError("MiniMax-M3 sparse attention requires Q, K, and V to have the same dtype")
 
@@ -338,6 +371,10 @@ def _run_generic_block_sparse_attention(
             or (
                 torch.float8_e4m3fn == key.dtype
                 and get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
+            )
+            or (
+                torch.int8 == key.dtype
+                and get_current_hardware_profile().supports(HardwareCapability.MINIMAX_M3_INT8_SPARSE_ATTENTION)
             )
         )
         and q.dtype == key.dtype
@@ -669,6 +706,9 @@ def _minimax_m3_sparse_attn_a3(
     block_size: int,
     *,
     max_query_len: int = -1,
+    int8_k_scale: torch.Tensor | None = None,
+    int8_v_scale: torch.Tensor | None = None,
+    int8_p_scale: torch.Tensor | None = None,
 ) -> None:
     key, value = _split_main_kv_cache(kv_cache)
     out = _run_generic_block_sparse_attention(
@@ -684,6 +724,9 @@ def _minimax_m3_sparse_attn_a3(
         sm_scale=sm_scale,
         block_size=block_size,
         max_query_len=max_query_len,
+        int8_k_scale=int8_k_scale,
+        int8_v_scale=int8_v_scale,
+        int8_p_scale=int8_p_scale,
     )
     output.copy_(out)
 
@@ -784,6 +827,10 @@ def minimax_m3_sparse_attn(
     block_size: int = 128,
     total_kv_blocks: int = -1,
     max_kv_blocks: int = -1,
+    *,
+    int8_k_scale: torch.Tensor | None = None,
+    int8_v_scale: torch.Tensor | None = None,
+    int8_p_scale: torch.Tensor | None = None,
 ) -> None:
     del prefix_lens
     common_args = (
@@ -800,6 +847,17 @@ def minimax_m3_sparse_attn(
     )
     hardware_profile = get_current_hardware_profile()
     supports_fp8 = hardware_profile.supports(HardwareCapability.FP8_ATTENTION)
+    # The INT8 KV cache has no K2Q split-KV or Union kernel; prefill always
+    # runs through GBSA quantType=7 in that mode.
+    if isinstance(kv_cache, (tuple, list)) and len(kv_cache) >= 1 and _kv_cache_dtype(kv_cache) == torch.int8:
+        _minimax_m3_sparse_attn_a3(
+            *common_args,
+            max_query_len=max_query_len,
+            int8_k_scale=int8_k_scale,
+            int8_v_scale=int8_v_scale,
+            int8_p_scale=int8_p_scale,
+        )
+        return
     # Select the optional optimization by ACLNN availability. The installed
     # experimental package must provide kernels for the current device.
     if not _is_minimax_sparse_attention_split_kv_available():
@@ -812,6 +870,15 @@ def minimax_m3_sparse_attn(
         max_kv_blocks,
         supports_fp8=supports_fp8,
     )
+
+
+def _kv_cache_dtype(
+    kv_cache: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+) -> torch.dtype:
+    """Return the main K cache dtype from a cache tensor or (K, V) pair."""
+    if isinstance(kv_cache, (tuple, list)):
+        return kv_cache[0].dtype
+    return kv_cache.dtype
 
 
 @torch.no_grad()
@@ -830,6 +897,9 @@ def minimax_m3_sparse_attn_decode(
     select_num_idx: torch.Tensor | None = None,
     dequant_scale: torch.Tensor | None = None,
     cu_seqlens_q: torch.Tensor | None = None,
+    int8_k_scale: torch.Tensor | None = None,
+    int8_v_scale: torch.Tensor | None = None,
+    int8_p_scale: torch.Tensor | None = None,
     gbsa_metadata_cache: dict[tuple[Any, ...], torch.Tensor] | None = None,
     indices_are_sorted: bool = False,
 ) -> None:
@@ -863,6 +933,9 @@ def minimax_m3_sparse_attn_decode(
         block_size=block_size,
         max_query_len=decode_query_len,
         dequant_scale=dequant_scale,
+        int8_k_scale=int8_k_scale,
+        int8_v_scale=int8_v_scale,
+        int8_p_scale=int8_p_scale,
         gbsa_metadata_cache=gbsa_metadata_cache,
         indices_are_sorted=indices_are_sorted,
     )

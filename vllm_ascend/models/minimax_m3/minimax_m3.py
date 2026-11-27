@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only MiniMaxM3 model."""
 
+import os
 from collections.abc import Iterable, MutableSequence, Sequence
 from itertools import islice
 from typing import Any
@@ -162,6 +163,10 @@ def _resolve_layer_kv_cache_dtypes(
         # fixed-scale sparse-attention and indexer paths consume native E4M3
         # tensors, so preserve that physical dtype at the cache-spec boundary.
         kv_cache_torch_dtype = torch.float8_e4m3fn
+    elif kv_cache_dtype == "int8":
+        # The A2/A3 GBSA quantType=7 path consumes native INT8 K/V caches;
+        # pin torch.int8 instead of vLLM's generic dtype handling.
+        kv_cache_torch_dtype = torch.int8
     else:
         kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(kv_cache_dtype, model_config)
     return kv_cache_dtype, kv_cache_torch_dtype
@@ -336,6 +341,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
         self.sparse_block_size = sparse_cfg["sparse_block_size"]
+        # The lightning-indexer scoring kernels have no INT8 path; keep the
+        # index K cache in BF16 when the main cache runs GBSA INT8.
+        indexer_kv_cache_dtype = "auto" if self.kv_cache_dtype == "int8" else self.kv_cache_dtype
+        indexer_kv_cache_torch_dtype = (
+            torch.bfloat16 if self.kv_cache_dtype == "int8" else self.kv_cache_torch_dtype
+        )
         self.indexer = AscendMiniMaxM3Indexer(
             num_kv_heads=self.num_kv_heads,
             scale=self.scaling,
@@ -347,8 +358,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             init_blocks=sparse_cfg.get("sparse_init_block", 0),
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             cache_config=cache_config,
-            kv_cache_dtype=self.kv_cache_dtype,
-            kv_cache_torch_dtype=self.kv_cache_torch_dtype,
+            kv_cache_dtype=indexer_kv_cache_dtype,
+            kv_cache_torch_dtype=indexer_kv_cache_torch_dtype,
         )
 
         compilation_config = vllm_config.compilation_config
@@ -356,6 +367,95 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
         self.kv_cache = torch.tensor([])
+
+        # GBSA quantType=7 state: per-page K scales are written alongside the
+        # INT8 K cache; V uses a static per-channel scale and P a per-tensor
+        # scale. Defaults only make the path runnable; calibrate or supply
+        # checkpoint scales for production accuracy.
+        self._int8_k_scale_cache: torch.Tensor | None = None
+        # Non-persistent buffers follow the model onto the NPU device without
+        # entering the checkpoint state dict.
+        self.register_buffer(
+            "int8_v_scale",
+            torch.full(
+                (self.num_kv_heads, self.head_dim),
+                float(os.environ.get("VLLM_ASCEND_M3_INT8_V_SCALE", "1.0")),
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "int8_p_scale",
+            torch.full(
+                (1,),
+                float(os.environ.get("VLLM_ASCEND_M3_INT8_P_SCALE", "127.0")),
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+
+    def _ensure_int8_k_scale_cache(self, key_cache: torch.Tensor) -> torch.Tensor:
+        """Lazily allocate the page-shaped FP32 K-scale cache.
+
+        Allocation happens on the first cache write (warmup) before graph
+        capture, mirroring the GBSA metadata reuse pattern.
+        """
+        cache = self._int8_k_scale_cache
+        if cache is None or cache.shape[0] != key_cache.shape[0]:
+            if cache is not None:
+                raise ValueError(
+                    f"INT8 K-scale cache was allocated for {cache.shape[0]} pages "
+                    f"but the K cache has {key_cache.shape[0]}; KV cache pool changed at runtime."
+                )
+            cache = torch.full(
+                (key_cache.shape[0], self.num_kv_heads, key_cache.shape[1]),
+                1.0,
+                dtype=torch.float32,
+                device=key_cache.device,
+            )
+            self._int8_k_scale_cache = cache
+        return cache
+
+    def _quantize_kv_int8(
+        self,
+        k_insert: torch.Tensor,
+        v_insert: torch.Tensor,
+        key_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize K/V for the GBSA INT8 KV cache.
+
+        K: per-token per-head dynamic quantization (``npu_dynamic_quant`` over
+        each token-head row); the FP32 scales land in the page-shaped
+        ``[numBlocks, kvHeads, 128]`` cache at the slot positions.
+        V: static per-channel scale division into the INT8 grid.
+        """
+        num_tokens = k_insert.shape[0]
+        # Warmup/graph padding batches carry no tokens; still allocate the
+        # scale cache so later attention calls find it.
+        self._ensure_int8_k_scale_cache(key_cache)
+        if num_tokens == 0:
+            return k_insert.to(torch.int8), v_insert.to(torch.int8)
+        k_rows = k_insert.reshape(num_tokens * self.num_kv_heads, self.head_dim)
+        k_quant, k_row_scales = torch_npu.npu_dynamic_quant(k_rows, dst_type=torch.int8)
+
+        k_scale_cache = self._int8_k_scale_cache
+        assert k_scale_cache is not None
+        flat_scales = k_scale_cache.view(-1, self.num_kv_heads)
+        # Slots address (page, in-page position); one scale row per token.
+        # Keep the same capture-proven scatter path as the index cache.
+        torch.ops._C_ascend.npu_scatter_nd_update_sk(
+            flat_scales,
+            slot_mapping.reshape(-1, 1).to(torch.int64),
+            k_row_scales.reshape(num_tokens, self.num_kv_heads).to(torch.float32),
+        )
+
+        v_quant = torch.clamp(
+            torch.round(v_insert / self.int8_v_scale.to(v_insert.dtype)),
+            -127.0,
+            127.0,
+        ).to(torch.int8)
+        return k_quant.view_as(k_insert), v_quant
 
     def get_attn_backend(self) -> type[AscendMiniMaxM3SparseBackend]:
         return self.attn_backend
@@ -390,8 +490,16 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         num_tokens = main_meta.num_actual_tokens
         k_insert = key[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
         v_insert = value[:num_tokens].view(-1, self.num_kv_heads, self.head_dim)
-        k_insert = _cast_for_cache(k_insert, key_cache)
-        v_insert = _cast_for_cache(v_insert, value_cache)
+        if key_cache.dtype == torch.int8:
+            k_insert, v_insert = self._quantize_kv_int8(
+                k_insert,
+                v_insert,
+                key_cache,
+                main_meta.slot_mapping[:num_tokens],
+            )
+        else:
+            k_insert = _cast_for_cache(k_insert, key_cache)
+            v_insert = _cast_for_cache(v_insert, value_cache)
         DeviceOperator.reshape_and_cache(
             k_insert,
             v_insert,
